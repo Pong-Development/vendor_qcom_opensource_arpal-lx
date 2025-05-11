@@ -2,6 +2,8 @@ LOCAL_PATH:= $(call my-dir)
 
 LOCAL_CFLAGS += -Wall -Werror
 
+ifneq ($(QCPATH),)
+
 #--------------------------------------------
 #          Build bt_bundle LIB
 #--------------------------------------------
@@ -86,3 +88,4 @@ LOCAL_MODULE_OWNER := qti
 LOCAL_VENDOR_MODULE := true
 include $(BUILD_SHARED_LIBRARY)
 
+endif
