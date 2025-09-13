@@ -26,8 +26,8 @@
  * OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN
  * IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
- * Changes from Qualcomm Innovation Center, Inc. are provided under the following license:
- * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Changes from Qualcomm Technologies, Inc. are provided under the following license:
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  * SPDX-License-Identifier: BSD-3-Clause-Clear
  */
 
@@ -161,6 +161,7 @@ uint32_t pal_log_lvl = (PAL_LOG_ERR|PAL_LOG_INFO);
 static struct str_parms *configParamKVPairs;
 
 char rmngr_xml_file[XML_PATH_MAX_LENGTH] = {0};
+char rmngr_xml_file_wo_variant[XML_PATH_MAX_LENGTH] = {0};
 
 char vendor_config_path[VENDOR_CONFIG_PATH_MAX_LENGTH] = {0};
 
@@ -471,7 +472,6 @@ bool ResourceManager::isUpdDedicatedBeEnabled = false;
 bool ResourceManager::isUpdSetCustomGainEnabled = false;
 int ResourceManager::max_voice_vol = -1;     /* Variable to store max volume index for voice call */
 bool ResourceManager::isSignalHandlerEnabled = false;
-bool ResourceManager::a2dp_suspended = false;
 
 //TODO:Needs to define below APIs so that functionality won't break
 #ifdef FEATURE_IPQ_OPENWRT
@@ -762,7 +762,10 @@ ResourceManager::ResourceManager()
         throw std::runtime_error("error in init audio route and audio mixer");
     }
 
+    cardState = CARD_STATUS_ONLINE;
     ret = ResourceManager::XmlParser(rmngr_xml_file);
+    if (ret == -ENOENT) // try resourcemanager xml without variant name
+        ret = ResourceManager::XmlParser(rmngr_xml_file_wo_variant);
     if (ret) {
         PAL_ERR(LOG_TAG, "error in resource xml parsing ret %d", ret);
         throw std::runtime_error("error in resource xml parsing");
@@ -5569,6 +5572,11 @@ void  ResourceManager::checkSpeakerConcurrency(struct pal_device *deviceattr,
                     PAL_ERR(LOG_TAG, "Getting Device instance failed");
                     continue;
                 }
+                //This is intent to check if any wired headset/headphones active streams only, so ignoring other devices’ active streams
+                if (( curDevAttr->id != PAL_DEVICE_OUT_WIRED_HEADSET) && ( curDevAttr->id != PAL_DEVICE_OUT_WIRED_HEADPHONE)) {
+                    PAL_INFO(LOG_TAG, "Shared BE device[%d] not wired headset, ignore",  curDevAttr->id);
+                    continue;
+                }
                 curDev->getDeviceAttributes(curDevAttr);
                 if (((curDevAttr->config.sample_rate % SAMPLINGRATE_44K == 0) &&
                     (sAttr->out_media_config.sample_rate % SAMPLINGRATE_44K != 0)) ||
@@ -6613,7 +6621,7 @@ void ResourceManager::getSharedBEActiveStreamDevs(std::vector <std::tuple<Stream
                     (*it)->getAssociatedDevices(devices);
                     typename std::vector<std::shared_ptr<Device>>::iterator result =
                              std::find(devices.begin(), devices.end(), dev);
-                    if (result != devices.end())
+                    if ((result != devices.end()) && (i == dev_id))
                         activeStreams.push_back(*it);
                 }
                 PAL_DBG(LOG_TAG, "got dev %d active streams on dev is %zu", i, activeStreams.size() );
@@ -7299,6 +7307,8 @@ bool ResourceManager::updateDeviceConfig(std::shared_ptr<Device> *inDev,
     struct pal_device spkr_devAttr;
     struct pal_device *temp_devAttr = nullptr;
     int stream_idx = 0;
+    struct pal_stream_attributes sAttr;
+    std::vector<std::shared_ptr<Device>> devices;
 
     PAL_DBG(LOG_TAG, "Enter");
 
@@ -7464,6 +7474,42 @@ bool ResourceManager::updateDeviceConfig(std::shared_ptr<Device> *inDev,
             for (sIter = streamsToSwitch.begin(); sIter != streamsToSwitch.end(); sIter++) {
                 streamDevDisconnect.push_back({(*sIter), streamDevAttr.id});
                 streamDevConnect.push_back({(*sIter), &streamDevAttr});
+            }
+        }
+    }
+    /*
+     * Switching any existing playback streams active on previous device
+     * when new device is selected for call, as both of them have dangling link
+     * to TX device, and vise versa, i.e. switching active streams on previous device
+     * to new voice device if voice call is starting on a different device.
+     */
+    if (inStrAttr->type == PAL_STREAM_VOICE_CALL) {
+        for (auto& str: mActiveStreams) {
+            if (!isStreamActive(str, mActiveStreams))
+                continue;
+            status = str->getStreamAttributes(&sAttr);
+            if (status != 0) {
+                PAL_ERR(LOG_TAG,"stream get attributes failed");
+                continue;
+            }
+            if (sAttr.direction == PAL_AUDIO_OUTPUT &&
+                (sAttr.type == PAL_STREAM_LOW_LATENCY ||
+                sAttr.type == PAL_STREAM_DEEP_BUFFER ||
+                sAttr.type == PAL_STREAM_PCM_OFFLOAD ||
+                sAttr.type == PAL_STREAM_COMPRESSED ||
+                sAttr.type == PAL_STREAM_GENERIC ||
+                sAttr.type == PAL_STREAM_VOIP_RX ||
+                sAttr.type == PAL_STREAM_ULTRA_LOW_LATENCY)) {
+                devices.clear();
+                str->getAssociatedDevices(devices);
+                if (devices.size() > 0) {
+                    for (auto device: devices) {
+                        if (device->getSndDeviceId() != inDevAttr->id) {
+                            streamDevDisconnect.push_back({str, device->getSndDeviceId()});
+                            streamDevConnect.push_back({str, inDevAttr});
+                        }
+                    }
+                }
             }
         }
     }
@@ -8997,7 +9043,6 @@ int ResourceManager::setParameter(uint32_t param_id, void *param_payload,
                 (pal_param_device_connection_t *)param_payload;
             std::shared_ptr<Device> dev = nullptr;
             struct pal_device dattr;
-            pal_param_bta2dp_t param_bt_a2dp;
 
             PAL_INFO(LOG_TAG, "Device %d connected = %d",
                         device_connection->id,
@@ -9010,25 +9055,8 @@ int ResourceManager::setParameter(uint32_t param_id, void *param_payload,
                     device_connection->id == PAL_DEVICE_IN_BLUETOOTH_BLE)) {
                     dattr.id = device_connection->id;
                     dev = Device::getInstance(&dattr, rm);
-                    if (dev) {
+                    if (dev)
                         status = dev->setDeviceParameter(param_id, param_payload);
-                        /* Set a2dp_suspended true if it is set to true before device
-                         * connection, and reset it at device device disconnection
-                         */
-                        if (!status && a2dp_suspended &&
-                            device_connection->id == PAL_DEVICE_OUT_BLUETOOTH_A2DP) {
-                           if (device_connection->connection_state) {
-                               param_bt_a2dp.a2dp_suspended = true;
-                               PAL_DBG(LOG_TAG, "Applying cached a2dp_suspended true param");
-                               mResourceManagerMutex.unlock();
-                               status = dev->setDeviceParameter(PAL_PARAM_ID_BT_A2DP_SUSPENDED,
-                                                                &param_bt_a2dp);
-                               mResourceManagerMutex.lock();
-                           } else {
-                               a2dp_suspended = false;
-                           }
-                        }
-                    }
                 } else {
                     status = SwitchSoundTriggerDevices(
                         device_connection->connection_state,
@@ -9360,24 +9388,11 @@ int ResourceManager::setParameter(uint32_t param_id, void *param_payload,
             struct pal_device a2dp_dattr;
             pal_param_bta2dp_t *current_param_bt_a2dp = nullptr;
             pal_param_bta2dp_t *param_bt_a2dp = nullptr;
+            bool skip_switch = false;
 
             mResourceManagerMutex.unlock();
             param_bt_a2dp = (pal_param_bta2dp_t*)param_payload;
-
-            if (param_bt_a2dp->a2dp_suspended == true) {
-                //TODO:Need to check for Broadcast and BLE unicast concurrency UC
-                if (isDeviceAvailable(param_bt_a2dp->dev_id)) {
-                    a2dp_dattr.id = param_bt_a2dp->dev_id;
-                } else {
-                    PAL_ERR(LOG_TAG, "a2dp/ble device %d is unavailable, set param %d failed",
-                        param_bt_a2dp->dev_id, param_id);
-                    status = -EIO;
-                    goto exit_no_unlock;
-                }
-            } else {
-                a2dp_dattr.id = param_bt_a2dp->dev_id;
-            }
-
+            a2dp_dattr.id = param_bt_a2dp->dev_id;
             a2dp_dev = Device::getInstance(&a2dp_dattr , rm);
             if (!a2dp_dev) {
                 PAL_ERR(LOG_TAG, "Failed to get A2DP/BLE instance");
@@ -9390,8 +9405,10 @@ int ResourceManager::setParameter(uint32_t param_id, void *param_payload,
                 PAL_INFO(LOG_TAG, "A2DP/BLE already in requested state, ignoring");
                 goto exit_no_unlock;
             }
+            if (!isDeviceAvailable(param_bt_a2dp->dev_id))
+                skip_switch = true;
 
-            if (param_bt_a2dp->a2dp_suspended == false) {
+            if (!skip_switch && param_bt_a2dp->a2dp_suspended == false) {
                 struct pal_device sco_tx_dattr;
                 struct pal_device sco_rx_dattr;
                 std::shared_ptr<Device> sco_tx_dev = nullptr;
@@ -9577,22 +9594,11 @@ int ResourceManager::setParameter(uint32_t param_id, void *param_payload,
             struct pal_device a2dp_dattr;
             pal_param_bta2dp_t* current_param_bt_a2dp = nullptr;
             pal_param_bta2dp_t* param_bt_a2dp = nullptr;
+            bool skip_switch = false;
 
             mResourceManagerMutex.unlock();
             param_bt_a2dp = (pal_param_bta2dp_t*)param_payload;
-
-            if (param_bt_a2dp->a2dp_capture_suspended == true) {
-                if (isDeviceAvailable(param_bt_a2dp->dev_id)) {
-                    a2dp_dattr.id = param_bt_a2dp->dev_id;
-                } else {
-                    PAL_ERR(LOG_TAG, "a2dp/ble device %d is unavailable, set param %d failed",
-                        param_bt_a2dp->dev_id, param_id);
-                    status = -EIO;
-                    goto exit_no_unlock;
-                }
-            } else {
-                a2dp_dattr.id = param_bt_a2dp->dev_id;
-            }
+            a2dp_dattr.id = param_bt_a2dp->dev_id;
 
             a2dp_dev = Device::getInstance(&a2dp_dattr, rm);
             if (!a2dp_dev) {
@@ -9606,8 +9612,10 @@ int ResourceManager::setParameter(uint32_t param_id, void *param_payload,
                 PAL_INFO(LOG_TAG, "A2DP/BLE already in requested state, ignoring");
                 goto exit_no_unlock;
             }
+            if (!isDeviceAvailable(param_bt_a2dp->dev_id))
+                skip_switch = true;
 
-            if (param_bt_a2dp->a2dp_capture_suspended == false) {
+            if (!skip_switch && param_bt_a2dp->a2dp_capture_suspended == false) {
                 /* Handle bt sco out running usecase */
                 struct pal_device sco_rx_dattr;
                 struct pal_stream_attributes sAttr;
@@ -11565,7 +11573,7 @@ int ResourceManager::XmlParser(std::string xmlFile)
     PAL_INFO(LOG_TAG, "XML parsing started - file name %s", xmlFile.c_str());
     file = fopen(xmlFile.c_str(), "r");
     if(!file) {
-        ret = EINVAL;
+        ret = -ENOENT;
         PAL_ERR(LOG_TAG, "Failed to open xml file name %s ret %d", xmlFile.c_str(), ret);
         goto done;
     }
